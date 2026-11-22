@@ -109,7 +109,7 @@ def rebin_image(img):
     '''Sum-rebin a trimmed, unbinned reference image (rows, cols) onto the
     trimmed grid of the binned data (as on-chip binning would).'''
     if BIN_X == 1 and BIN_Y == 1:
-        return img
+        return np.asarray(img, dtype=float)  # native byte order for scipy
     nyb = (img.shape[0] + 2) // BIN_Y - 2
     nxb = (img.shape[1] + 2) // BIN_X - 2
     r0, c0 = BIN_Y - 1, BIN_X - 1
@@ -121,7 +121,7 @@ def rebin_orders(arr, how='sum'):
     '''Rebin the column (dispersion) axis of an (orders, columns) reference array.
     Use how='sum' for fluxes and how='mean' for wavelengths.'''
     if BIN_X == 1:
-        return arr
+        return np.asarray(arr, dtype=float)  # native byte order for scipy
     nxb = (arr.shape[1] + 2) // BIN_X - 2
     c0 = BIN_X - 1
     sub = np.asarray(arr, dtype=float)[:, c0:c0 + BIN_X * nxb]
@@ -133,7 +133,7 @@ def rebin_trace(trace):
     '''Convert an unbinned trace (orders, columns) of row positions to the
     binned grid, in both its column sampling and its row units.'''
     if BIN_X == 1 and BIN_Y == 1:
-        return trace
+        return np.asarray(trace, dtype=float)  # native byte order for scipy
     nxb = (trace.shape[1] + 2) // BIN_X - 2
     xu = np.arange(trace.shape[1])
     xb = binned_to_unbinned(np.arange(nxb), BIN_X)
@@ -1411,7 +1411,7 @@ def measure_fiber_profile(image, spec, trace, chunksize=100, npix=17,
 
     '''
     chunksize = nx(chunksize, minimum=10)  # columns per profile chunk
-    nprof = max(10, int(round(75. / (BIN_X * BIN_Y))))  # keep samples per profile bin
+    nprof = max(10, int(round(75. / BIN_Y)))  # profile bins sample the row direction
     yind, xind = np.indices(image.shape)
     profile = []
     xinds = np.array_split(np.arange(4, image.shape[1]-4), 
@@ -1708,8 +1708,13 @@ def get_wavelength_offset_from_archive(archive_arc, archive_wave, arc_spectra):
                                   per=35)
     cont = get_continuum(arc_spectra, nbins=105, use_filter=True, per=35)
 
-    # Step 2: Initialize step offsets array
+    # Step 2: Initialize step offsets array.  Orders without arc signal (e.g.
+    # the bluest orders) have no measured shift and must stay out of the fits
+    # below, otherwise their zero "shift" drags the polynomial, which matters
+    # when the true shifts are large (many Angstroms).
     step = np.zeros((len(archive_arc),))
+    has_signal = np.array([not np.all(arc_spectra[i] == 0.)
+                           for i in range(len(archive_arc))])
 
     # Step 3: Loop through each row (spectral order) and calculate wavelength shifts
     for i in np.arange(len(archive_arc)):
@@ -1727,8 +1732,8 @@ def get_wavelength_offset_from_archive(archive_arc, archive_wave, arc_spectra):
 
     # Step 4: Fit a polynomial to the wavelength offsets
     xind = np.arange(len(step))
-    or_fitted_model, mask = or_fit(P3, xind, step)  
-    wave_offsets = or_fitted_model(xind)  
+    or_fitted_model, mask = or_fit(P3, xind[has_signal], step[has_signal])
+    wave_offsets = or_fitted_model(xind)
 
     # Step 5: Plot the wavelength offset for visualization
     make_1d_waveoffset_plot(xind, or_fitted_model, step, folder)
@@ -1794,8 +1799,8 @@ def get_wavelength_offset_from_archive(archive_arc, archive_wave, arc_spectra):
             continue    
         corrections[row] = fitter(P1, wchunk[row], steps_model[row])(W[row])
     
-    good = np.isfinite(corrections != 0.0)
-    xind, yind = np.indices(corrections.shape)  
+    good = np.repeat(has_signal[:, np.newaxis], corrections.shape[1], axis=1)
+    xind, yind = np.indices(corrections.shape)
     or_fitted_model, mask = or_fit(P2d, xind[good], yind[good], corrections[good]) 
     corrections = or_fitted_model(xind, yind) 
     
@@ -2653,7 +2658,9 @@ gain = 0.584  # Conversion factor from electrons to ADU (Analog-to-Digital Units
 readnoise = READNOISE  # Read noise of the detector in electrons (e-)
 fiber_model_thresh = 250 * BIN_X * BIN_Y  # Threshold for fiber model fitting (counts per binned pixel)
 trace_order = 4  # Polynomial order used for tracing the fiber paths
-trace_ncolumns = nx(250)  # Number of columns used for fiber tracing
+# Number of column chunks used for fiber tracing.  This is a count, not a width: it sets
+# how many rows a trace moves between neighbouring chunks, so it is NOT scaled by binning.
+trace_ncolumns = 250
 flat_line_list = [  # Wavelengths (in Ångströms) of emission lines in the flat-field
     3679.9, 3705.6, 3719.9, 3722.6, 3733.3, 3734.9, 3737.1,
     3745.6, 3748.3, 3820.5, 3824.4, 3856.4, 3859.9, 3878.6,
