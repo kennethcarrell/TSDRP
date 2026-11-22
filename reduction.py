@@ -37,6 +37,112 @@ from skimage.registration import phase_cross_correlation
 
 
 
+# =============================================================================
+# Binning support
+# =============================================================================
+# Every pixel-scale constant in this file was tuned for unbinned (1x1) frames.
+# BIN_X is the binning along columns (the dispersion axis) and BIN_Y the binning
+# along rows (the cross-dispersion axis), from CCDSUM = "BIN_X BIN_Y".  Both
+# default to 1, for which every helper below returns the original unbinned
+# value.  They are set in the main program once the data have been inspected.
+BIN_X = 1
+BIN_Y = 1
+READNOISE = 3.06  # e-; replaced by the header value (RDNOISE3) in the main program
+
+
+def parse_ccdsum(header):
+    '''Return (xbin, ybin) from the CCDSUM keyword ("xbin ybin"), (1, 1) if absent.'''
+    ccdsum = header.get('CCDSUM', '1 1')
+    try:
+        bx, by = [int(v) for v in str(ccdsum).split()[:2]]
+    except ValueError:
+        raise ValueError('Cannot parse CCDSUM=%r' % (ccdsum,))
+    return bx, by
+
+
+def nx(n, minimum=1):
+    '''Length in unbinned columns -> whole binned columns (halves round up).'''
+    return max(minimum, int(np.floor(n / BIN_X + 0.5)))
+
+
+def ny(n, minimum=1):
+    '''Length in unbinned rows -> whole binned rows (halves round up).'''
+    return max(minimum, int(np.floor(n / BIN_Y + 0.5)))
+
+
+def fx(v):
+    '''Length in unbinned columns -> binned columns (float).'''
+    return v / BIN_X
+
+
+def fy(v):
+    '''Length in unbinned rows -> binned rows (float).'''
+    return v / BIN_Y
+
+
+def picket_window(picket_bias, picket_height):
+    '''Row window about a trace, given in unbinned rows, as (bias, height) in
+    binned rows.  The window is widened, never narrowed, to whole binned rows.'''
+    return (int(np.floor(picket_bias / BIN_Y)),
+            int(np.ceil(picket_height / BIN_Y)))
+
+
+# Coordinates.  The pipeline trims one pixel from every edge of the (binned)
+# frame, so trimmed binned pixel I covers trimmed unbinned pixels
+# b*I + (b-1) ... b*I + 2b - 2, whose centre is b*I + 1.5*(b-1).
+def unbinned_to_binned(u, b):
+    '''Pixel-centre position, trimmed unbinned frame -> trimmed binned frame.'''
+    return (np.asarray(u, dtype=float) - 1.5 * (b - 1)) / b
+
+
+def binned_to_unbinned(i, b):
+    '''Pixel-centre position, trimmed binned frame -> trimmed unbinned frame.'''
+    return b * np.asarray(i, dtype=float) + 1.5 * (b - 1)
+
+
+def unbinned_pixel_to_binned_index(u, b):
+    '''Index of the trimmed binned pixel that contains trimmed unbinned pixel u.'''
+    return (int(u) - (b - 1)) // b
+
+
+def rebin_image(img):
+    '''Sum-rebin a trimmed, unbinned reference image (rows, cols) onto the
+    trimmed grid of the binned data (as on-chip binning would).'''
+    if BIN_X == 1 and BIN_Y == 1:
+        return img
+    nyb = (img.shape[0] + 2) // BIN_Y - 2
+    nxb = (img.shape[1] + 2) // BIN_X - 2
+    r0, c0 = BIN_Y - 1, BIN_X - 1
+    sub = np.asarray(img, dtype=float)[r0:r0 + BIN_Y * nyb, c0:c0 + BIN_X * nxb]
+    return sub.reshape(nyb, BIN_Y, nxb, BIN_X).sum(axis=(1, 3))
+
+
+def rebin_orders(arr, how='sum'):
+    '''Rebin the column (dispersion) axis of an (orders, columns) reference array.
+    Use how='sum' for fluxes and how='mean' for wavelengths.'''
+    if BIN_X == 1:
+        return arr
+    nxb = (arr.shape[1] + 2) // BIN_X - 2
+    c0 = BIN_X - 1
+    sub = np.asarray(arr, dtype=float)[:, c0:c0 + BIN_X * nxb]
+    sub = sub.reshape(arr.shape[0], nxb, BIN_X)
+    return sub.sum(axis=2) if how == 'sum' else sub.mean(axis=2)
+
+
+def rebin_trace(trace):
+    '''Convert an unbinned trace (orders, columns) of row positions to the
+    binned grid, in both its column sampling and its row units.'''
+    if BIN_X == 1 and BIN_Y == 1:
+        return trace
+    nxb = (trace.shape[1] + 2) // BIN_X - 2
+    xu = np.arange(trace.shape[1])
+    xb = binned_to_unbinned(np.arange(nxb), BIN_X)
+    out = np.array([np.interp(xb, xu, t) for t in np.asarray(trace, dtype=float)])
+    out = unbinned_to_binned(out, BIN_Y)
+    out[np.all(np.asarray(trace) == 0., axis=1)] = 0.  # keep unused orders at zero
+    return out
+
+
 def get_script_path():
     ''' Get Tull reduction absolute path name '''
     return op.dirname(op.realpath(sys.argv[0]))
@@ -127,7 +233,7 @@ def get_continuum(spectra, nbins=25, use_filter=False, per=5):
     return cont
 
 
-def get_fiber_profile_order(image, spec, trace, order, npix=11):
+def get_fiber_profile_order(image, spec, trace, order, npix=None):
     '''
     Extracts the fiber profile for a given order of a spectrum from an image.
 
@@ -154,6 +260,9 @@ def get_fiber_profile_order(image, spec, trace, order, npix=11):
 
     '''
     
+    if npix is None:
+        npix = ny(11)
+
     # Initialize lists to store results
     xi, yi, ri = ([], [], [])
     
@@ -218,7 +327,7 @@ def base_reduction(image, masterbias=None, Ncols=2048,
 
 
 
-def get_spectra(array_flt, array_trace, error_array=None, npix=11, 
+def get_spectra(array_flt, array_trace, error_array=None, npix=None, 
                 full_data=False, weighted_extraction=False):
     '''
     Extracts spectra from a flat-fielded 2D image by tracing fibers and summing 
@@ -254,10 +363,13 @@ def get_spectra(array_flt, array_trace, error_array=None, npix=11,
         row positions corrected for the trace of the 3D data array
     '''
     
+    if npix is None:
+        npix = ny(11)
+
     # If no error array is provided, calculate Poisson error 
     if error_array is None:
         pois_var = np.maximum(array_flt, 0)  # Ensure no negative variance
-        error_array = np.sqrt(pois_var + 3.06**2)  # Add read noise
+        error_array = np.sqrt(pois_var + READNOISE**2)  # Add read noise
        
     # Initialize arrays to store extracted spectra and errors
     spec = np.zeros_like(array_trace)
@@ -387,10 +499,10 @@ def get_scattered_light(image, mask, percentile=3, order=6):
 
         # Perform percentile filtering on the column to identify low values 
         bottom[-2:] = y[-2:]  # Copy the last two pixels unchanged
-        bottom[:-2] = percentile_filter(y[:-2], percentile, size=35)
+        bottom[:-2] = percentile_filter(y[:-2], percentile, size=ny(35))
         
         # Smooth the scattered light estimation using a Gaussian kernel 
-        bottom[:-2] = convolve(bottom[:-2], Gaussian1DKernel(25.), 
+        bottom[:-2] = convolve(bottom[:-2], Gaussian1DKernel(fy(25.)), 
                                boundary='extend')
 
         # Store the estimated scattered light for this column
@@ -409,7 +521,7 @@ def get_scattered_light(image, mask, percentile=3, order=6):
     # Loop through the columns and interpolate scattered light where needed
     for j in np.arange(1, scattered_light.shape[1] - 1):
         good = np.isfinite(scattered_light[:, j])  # Identify valid data points
-        if good.sum() > 1500:  # Only interpolate if there are enough points 
+        if good.sum() > int(1500 / BIN_Y):  # Only interpolate if there are enough points 
             scattered_light[:, j] = np.interp(x, x[good], 
                                               scattered_light[:, j][good])
 
@@ -430,7 +542,7 @@ def get_scattered_light(image, mask, percentile=3, order=6):
     for j in np.arange(new.shape[0]):
         y = new[j] * 1.  # Copy row data
         good = np.isfinite(y)  # Identify valid data points for fitting
-        if good.sum() > 1000:  # Perform fitting only if enough valid points
+        if good.sum() > int(1000 / BIN_X):  # Perform fitting only if enough valid points
             p0 = np.polyfit(x[good], y[good], order)  # Fit a polynomial
             z = np.polyval(p0, x)  # Evaluate the polynomial fit over the row
             scattered_light[j] = z  # Store the polynomial fit results
@@ -465,12 +577,12 @@ def get_background(image, trace, picket_bias=-8, picket_height=17):
     for j in np.arange(im.shape[1]):
         y = im[:, j]
         sel = y != 0.0
-        z = percentile_filter(y[sel], 50, size=50)
+        z = percentile_filter(y[sel], 50, size=ny(50))
         model = np.interp(x, x[sel], z)
         back[:, j] = model
     return back
 
-def find_arc_peaks(y, local_window=151, thresh_mult=3.):
+def find_arc_peaks(y, local_window=None, thresh_mult=3.):
     ''' Finds peaks in a given input array above threshold, thresh
 
     Parameters
@@ -503,6 +615,8 @@ def find_arc_peaks(y, local_window=151, thresh_mult=3.):
     diff_array = y[1:] - y[:-1]
     loc = np.where((diff_array[:-1] > 0.) * (diff_array[1:] < 0.))[0]
     peaks = y[loc+1]
+    if local_window is None:
+        local_window = nx(151)
     high_thresh = percentile_filter(y, 84, size=local_window)
     low_thresh = percentile_filter(y, 16, size=local_window)
     thresh = (high_thresh - low_thresh) / 2.
@@ -588,8 +702,12 @@ def get_trace(image, N=25, low=10, high=1850, order=7, keyorder=20):
         Array of average x-coordinates for each chunk.
     '''
     # Kernel setup for peak enhancement
-    B = Box1DKernel(8.)  # Smoothing kernel
-    G = Gaussian1DKernel(2.5)  # Gaussian kernel for refining peaks
+    # Lengths below are along the rows (cross-dispersion), so scale with BIN_Y
+    B = Box1DKernel(fy(8.))  # Smoothing kernel
+    G = Gaussian1DKernel(fy(2.5))  # Gaussian kernel for refining peaks
+    low, high = fy(low), fy(high)
+    fwin = ny(41, minimum=3)  # window of the percentile filter on the profile
+    lwin = ny(151)            # window of the local peak threshold
     
     # Divide the image into N column chunks and calculate average x-coordinates
     chunks = np.array_split(image, N, axis=1)
@@ -602,9 +720,9 @@ def get_trace(image, N=25, low=10, high=1850, order=7, keyorder=20):
     # Find reference order peaks in middle chunk using biweight mean
     y = biweight(chunks[M], ignore_nan=True, axis=1)
     c = convolve(y, B)  # Enhance fiber peaks
-    bottom = percentile_filter(c, 5, size=41)
+    bottom = percentile_filter(c, 5, size=fwin)
     c = convolve(c - bottom, G)  # Smooth using Gaussian kernel
-    ref, values = find_peaks(c, local_thresh=True)
+    ref, values = find_peaks(c, local_thresh=True, local_window=lwin)
     
     # Filter detected peaks to stay within defined bounds
     sel = (ref > low) & (ref < high)
@@ -619,9 +737,9 @@ def get_trace(image, N=25, low=10, high=1850, order=7, keyorder=20):
     for i in np.arange(M)[::-1]:
         y = biweight(chunks[i], ignore_nan=True, axis=1)
         c = convolve(y, B)
-        bottom = percentile_filter(c, 5, size=41)
+        bottom = percentile_filter(c, 5, size=fwin)
         c = convolve(c - bottom, G)
-        locs, values = find_peaks(c, local_thresh=True)
+        locs, values = find_peaks(c, local_thresh=True, local_window=lwin)
         
         # Align detected peaks to the reference locations
         D = np.abs(ref[:, np.newaxis] - locs[np.newaxis, :])
@@ -651,7 +769,7 @@ def get_trace(image, N=25, low=10, high=1850, order=7, keyorder=20):
     for i in np.arange(keyorder+1, trace.shape[0]):
         tracek[i] = tracek[i-1] + corrections[i-1]
     mstd = mad_std(full_trace - tracek, axis=1, ignore_nan=True)
-    for ind in np.where(mstd>1.0)[0]:
+    for ind in np.where(mstd>fy(1.0))[0]:
         log.info('Using neighboring model for trace of fiber: %i' % ind)
     Z = full_trace - tracek
     fitter = LevMarLSQFitter()
@@ -661,8 +779,8 @@ def get_trace(image, N=25, low=10, high=1850, order=7, keyorder=20):
     or_fitted_model, mask = or_fit(P2d, X, Y, Z) 
     offset = or_fitted_model(X, Y) 
     tracek = tracek + offset
-    full_trace[mstd>1.0] = tracek[mstd>1.0]
-    ghost_columns = list(np.where(mstd>1.0)[0])
+    full_trace[mstd>fy(1.0)] = tracek[mstd>fy(1.0)]
+    ghost_columns = list(np.where(mstd>fy(1.0))[0])
     return full_trace, trace, x, ghost_columns  # Return completed trace arrays
 
 
@@ -696,6 +814,7 @@ def make_mask_for_trace(image, trace, picket_height=23, picket_bias=-11,
         is set to 0.
     '''
 
+    picket_bias, picket_height = picket_window(picket_bias, picket_height)
     mask = 0. * image
     x = np.arange(image.shape[1])
     for j, y in enumerate(trace):
@@ -737,6 +856,7 @@ def normalize_aperture(image, image2, trace, picket_height=23, picket_bias=-11,
         is set to 0.
     '''
 
+    picket_bias, picket_height = picket_window(picket_bias, picket_height)
     norm = 0. * image
     x = np.arange(image.shape[1])
     N = np.zeros(trace.shape[0])
@@ -814,6 +934,7 @@ def build_flat(image, trace, spectra, picket_height=23, picket_bias=-11):
         input image. The region around each trace is normalized based on the 
         input spectra, while the rest of the mask is set to 1 (no correction).
     '''
+    picket_bias, picket_height = picket_window(picket_bias, picket_height)
     mask = 0. * image
     mask[:] = 1.
     x = np.arange(image.shape[1])
@@ -919,19 +1040,23 @@ def make_mask(image, picket_height=21, picket_bias=0, mask_picket=False):
         (to exclude them from further analysis), while the rest of the mask is 0.
     '''
 
+    picket_bias, picket_height = picket_window(picket_bias, picket_height)
     mask = 0. * image
-    # Columns to mask
+    # Columns to mask.  Positions are listed in unbinned pixels; a binned
+    # column is masked if it contains a bad unbinned column.
     badcols = [198, 199, 214, 215, 979]
     for badcol in badcols:
-        mask[:, badcol] = 1.
+        mask[:, unbinned_pixel_to_binned_index(badcol, BIN_X)] = 1.
     # Partial column(s) to mask
     badcols = [1633, 1634]
-    bottom = 1109
+    bottom = unbinned_pixel_to_binned_index(1109, BIN_Y)
     for badcol in badcols:
-        mask[bottom:, badcol] = 1.
+        mask[bottom:, unbinned_pixel_to_binned_index(badcol, BIN_X)] = 1.
     if mask_picket:
-        picket_fence_bottom_x = [14., 1014., 2029.]
-        picket_fence_bottom_y = [1120., 1056., 1020.]
+        picket_fence_bottom_x = [float(unbinned_to_binned(v, BIN_X))
+                                 for v in (14., 1014., 2029.)]
+        picket_fence_bottom_y = [float(unbinned_to_binned(v, BIN_Y))
+                                 for v in (1120., 1056., 1020.)]
         x = np.arange(image.shape[1])
         y = np.polyval(np.polyfit(picket_fence_bottom_x, 
                                   picket_fence_bottom_y, 2), x)
@@ -1008,7 +1133,7 @@ def make_2d_wavelength_offset_plot(corrections, folder):
     '''
 
     plt.figure(figsize=(8, 7))
-    plt.imshow(corrections, aspect=36, origin='lower', 
+    plt.imshow(corrections, aspect=36 / BIN_X, origin='lower', 
                cmap=plt.get_cmap('coolwarm'))
     plt.colorbar()
     ax = plt.gca()
@@ -1285,6 +1410,8 @@ def measure_fiber_profile(image, spec, trace, chunksize=100, npix=17,
         DESCRIPTION.
 
     '''
+    chunksize = nx(chunksize, minimum=10)  # columns per profile chunk
+    nprof = max(10, int(round(75. / (BIN_X * BIN_Y))))  # keep samples per profile bin
     yind, xind = np.indices(image.shape)
     profile = []
     xinds = np.array_split(np.arange(4, image.shape[1]-4), 
@@ -1302,8 +1429,8 @@ def measure_fiber_profile(image, spec, trace, chunksize=100, npix=17,
         if np.all(fibert == 0.):
             continue
         for xind in xinds:
-            indl = int(np.max([4, np.min(fibert[xind])-20.]))
-            indh = int(np.min([image.shape[0]-4, np.max(fibert[xind])+20.]))
+            indl = int(np.max([4, np.min(fibert[xind])-fy(20.)]))
+            indh = int(np.min([image.shape[0]-4, np.max(fibert[xind])+fy(20.)]))
             foff = (yind[indl:indh, xind[0]:xind[-1]] -
                     fibert[np.newaxis, xind[0]:xind[-1]])
             V = (image[indl:indh, xind[0]:xind[-1]] /
@@ -1312,8 +1439,8 @@ def measure_fiber_profile(image, spec, trace, chunksize=100, npix=17,
             allx = foff[sel]
             ally = V[sel]
             inorder = np.argsort(allx)
-            xbin = np.array([np.mean(chunk) for chunk in np.array_split(allx[inorder], 75)])
-            ybin = np.array([biweight(chunk) for chunk in np.array_split(ally[inorder], 75)])
+            xbin = np.array([np.mean(chunk) for chunk in np.array_split(allx[inorder], nprof)])
+            ybin = np.array([biweight(chunk) for chunk in np.array_split(ally[inorder], nprof)])
             back = biweight(ybin[(np.abs(xbin)>=LB) * (np.abs(xbin)<=LB+1.5)])
             ybin = ybin - back
             ybin[np.abs(xbin)>=LB] = 0.0
@@ -1326,7 +1453,7 @@ def measure_fiber_profile(image, spec, trace, chunksize=100, npix=17,
                               bounds_error=False)
             profile[-1].append(I)
         x = np.linspace(-LB, LB, N)
-        sel = np.abs(x) <= 2.5
+        sel = np.abs(x) <= fy(2.5)
         y = np.array([p(x) for p in profile[-1]])
         ny = biweight(y[:, sel], axis=0)
         Y = np.zeros((image.shape[1], len(x)))
@@ -1365,7 +1492,7 @@ def make_fiber_model_image(image, trace, wave, npix=17,
     '''
     
     # Get the spectra for the image
-    spec, err = get_spectra(image, trace, npix=15, full_data=False)
+    spec, err = get_spectra(image, trace, npix=ny(15), full_data=False)
     
     if line_list is not None:
         orig = spec * 1.
@@ -1462,6 +1589,11 @@ def fit_wavelength_solution(spectra):
     ioff = 0  
     W = np.nan * spectra  
     
+    # Line positions in the line list are in unbinned pixels; work in binned
+    # pixels, keeping the same normalization of the polynomial argument
+    x0 = float(unbinned_to_binned(1000., BIN_X))
+    xs = 2000. / BIN_X
+
     # Step 1: Get continuum for normalization
     cont = get_continuum(spectra, nbins=105, use_filter=True, per=35)
 
@@ -1470,7 +1602,7 @@ def fit_wavelength_solution(spectra):
         i = j - 2
         offset = ioff  
         sel = ecTHAR['col1'] == j + 1  
-        cols = ecTHAR['col3'][sel]  
+        cols = unbinned_to_binned(np.array(ecTHAR['col3'][sel]), BIN_X)  
         wave = ecTHAR['col4'][sel]  
 
         # Find arc peaks in the current spectrum (after removing continuum)
@@ -1494,12 +1626,12 @@ def fit_wavelength_solution(spectra):
         i = j - 2
         offset = offset_fit[i] 
         sel = ecTHAR['col1'] == j + 1  
-        cols = ecTHAR['col3'][sel]
+        cols = unbinned_to_binned(np.array(ecTHAR['col3'][sel]), BIN_X)
         wave = ecTHAR['col4'][sel]
 
         # Fit a 3rd-degree polynomial to the wavelength solution
-        sol = np.polyfit((cols + offset - 1000) / 2000., wave, 3)
-        wnorm = (np.arange(spectra.shape[1]) - 1000.) / 2000.  
+        sol = np.polyfit((cols + offset - x0) / xs, wave, 3)
+        wnorm = (np.arange(spectra.shape[1]) - x0) / xs  
         W[i] = np.polyval(sol, wnorm)  
 
     # Step 5: Refine wavelength solution across all spectral orders
@@ -1803,7 +1935,8 @@ def build_master_arc(arc_files, Nrows, Ncols, avg_bias):
     for i, filename in enumerate(arc_files):
         f = fits.open(filename)  
         # Perform base reduction with bias subtraction
-        image, error = base_reduction(f[0].data, masterbias=avg_bias)
+        image, error = base_reduction(f[0].data, masterbias=avg_bias,
+                                      Ncols=Ncols, readnoise=READNOISE)
         images[i] = image  
 
     # Step 3: Compute the average arc image using biweight averaging
@@ -1971,6 +2104,8 @@ def write_spectrum(original, image, image_e, image_m,
     '''
     
     # Add history entries to the FITS header for tracking processing steps
+    if BIN_X > 1 or BIN_Y > 1:
+        header['history'] = 'Reduced with CCD binning %i x %i' % (BIN_X, BIN_Y)
     header['history'] = 'Bias subtracted'
     header['history'] = 'Scatter Light Subtracted'
     header['history'] = 'Trace Adjusted'
@@ -2016,7 +2151,7 @@ def write_spectrum(original, image, image_e, image_m,
     hdulist = fits.HDUList(L)
     hdulist.writeto(name, overwrite=True)
     
-def match_trace_to_archive(trace, archive_trace, keyfiber=20, match_col=1900):
+def match_trace_to_archive(trace, archive_trace, keyfiber=20, match_col=None):
     '''
     
 
@@ -2036,6 +2171,8 @@ def match_trace_to_archive(trace, archive_trace, keyfiber=20, match_col=1900):
     None.
 
     '''
+    if match_col is None:  # column 1900 of the unbinned frame
+        match_col = int(np.round(unbinned_to_binned(1900., BIN_X)))
     ref = archive_trace[:, match_col]
     offset = np.argmin(np.abs(trace[:, match_col] - 
                        archival_trace[keyfiber, match_col]))
@@ -2161,7 +2298,7 @@ def plot_trace_offset(trace_cor, name):
     plt.figure(figsize=(8, 7))
 
     # Display the trace correction residuals as a coolwarm heatmap 
-    plt.imshow(trace_cor, aspect=36, origin='lower', 
+    plt.imshow(trace_cor, aspect=36 / BIN_X, origin='lower', 
                cmap=plt.get_cmap('coolwarm'))
     plt.colorbar()
 
@@ -2205,8 +2342,8 @@ def make_ghost_model(model, image, trace, ghost_order):
     ghost_image = np.zeros_like(image)  # Initialize ghost model array
 
     for col in np.arange(image.shape[1]):
-        mn = int(trace[ghost_order[0], col] - 15)  # Lower region bound
-        mx = int(trace[ghost_order[1] , col] + 15)  # Upper region bound
+        mn = int(trace[ghost_order[0], col] - fy(15))  # Lower region bound
+        mx = int(trace[ghost_order[1] , col] + fy(15))  # Upper region bound
         y = image[mn:mx, col] - model[mn:mx, col]  # Residual signal in column
         x = np.linspace(0, 1, len(y))  # Normalize x-axis
         xloc = x[np.nanargmax(y)]  # Peak location of residual
@@ -2296,7 +2433,7 @@ def make_flatfield_plot(flat_frame, ghost_image, model, flat):
     # Set up a figure with 4 vertically stacked subplots
     fig, axs = plt.subplots(4, 1, figsize=(8, 8*1.35), sharex=True, 
                             gridspec_kw={'hspace':0.01})
-    cutout = flat_frame[850:1290, 400:2000]  # Define region for percentile calculations
+    cutout = flat_frame[int(fy(850)):int(fy(1290)), int(fx(400)):int(fx(2000))]  # Define region for percentile calculations
     vni = np.nanpercentile(cutout, 0.2)  # Minimum normalization value
     vmi = np.nanpercentile(cutout, 99.8)  # Maximum normalization value
     vns = [vni, vni, vni, 0.98]  # Normalization vmin values
@@ -2308,11 +2445,11 @@ def make_flatfield_plot(flat_frame, ghost_image, model, flat):
     # Loop through images, axes, and settings to create each subplot
     for image, ax, vn, vm, name, color in zip([flat_frame, ghost_image, model, flat], 
                                               axs, vns, vms, names, colors):
-        cutout = image[750:1390, 10:2000]  # Define region for display
+        cutout = image[int(fy(750)):int(fy(1390)), int(fx(10)):int(fx(2000))]  # Define region for display
         norm = ImageNormalize(cutout, vmin=vn, vmax=vm, stretch=AsinhStretch())  # Normalization
 
         # Display the image on the subplot
-        ax.imshow(cutout, aspect=1.0, origin='lower', norm=norm, cmap=plt.get_cmap('Greys_r'))
+        ax.imshow(cutout, aspect=BIN_Y / BIN_X, origin='lower', norm=norm, cmap=plt.get_cmap('Greys_r'))
 
         # Format subplot ticks
         ax.tick_params(axis='both', which='both', direction='in', zorder=3)
@@ -2323,7 +2460,7 @@ def make_flatfield_plot(flat_frame, ghost_image, model, flat):
         ax.minorticks_on()
 
         # Add a label for the panel
-        ax.text(50, 1390-750-70, name, color=color)
+        ax.text(fx(50), fy(1390-750-70), name, color=color)
 
         # Clear x and y ticks for all subplots
         plt.sca(ax)
@@ -2356,7 +2493,7 @@ parser.add_argument("rootdir",
                     type=str)
 
 parser.add_argument("-ea", "--extraction_aperture",
-                    help='''Pixel aperture in "rows" used for extraction (default=11)''',
+                    help='''Pixel aperture in unbinned "rows" used for extraction (default=11); rescaled for binned data''',
                    type=int, default=11)
 
 
@@ -2395,6 +2532,10 @@ parser.add_argument("-ugm", "--use_ghost_model",
 parser.add_argument("-dat", "--dont_adjust_trace",
                     help='''Do not adjust the trace for individual frames''',
                     action="count", default=0)
+
+parser.add_argument("-bin", "--binning",
+                    help='''CCD binning "xbin ybin" of the frames to reduce, e.g. "2 1" (default: taken from the bias frames)''',
+                    type=str, default=None)
 
 args = None
 args = parser.parse_args(args=args)
@@ -2446,20 +2587,25 @@ path = op.join(basefolder, folder, '*.fits')
 filenames = sorted(glob.glob(path))
 names = []
 calstage = []
+ccdsums = []
 for filename in filenames:
+    header = None
     try:
-        f = fits.open(filename)
+        header = fits.getheader(filename)
     except:
         print('Could not open file: %s' % filename)
-    try:
-        names.append(f[0].header['OBJECT'])
-        # print('%s: %s' % (filename, names[-1])) # for debugging
-    except:
-         print('Could not find OBJECT name in %s' % filename)
-    try:
-        calstage.append(f[0].header['calstage'])
-    except:
+    # The lists are always appended to so they stay aligned with filenames
+    if header is not None and 'OBJECT' in header:
+        names.append(str(header['OBJECT']))
+    else:
+        print('Could not find OBJECT name in %s' % filename)
+        names.append('')
+    if header is not None and 'calstage' in header:
+        calstage.append(header['calstage'])
+    else:
         print('Could not find calstage name in %s' % filename)
+        calstage.append('')
+    ccdsums.append(parse_ccdsum(header) if header is not None else (1, 1))
    
 
 
@@ -2468,16 +2614,46 @@ for label in labels:
     setattr(args, label, getattr(args,label).lower())
 
 # =============================================================================
+# 1b. Determine the CCD binning of the data to reduce
+# =============================================================================
+# All frames of a reduction (bias, flat, arc, science) must share one binning.
+# By default it is taken from the bias frames; frames with another binning are
+# skipped.
+if args.binning is not None:
+    BIN_X, BIN_Y = [int(v) for v in args.binning.split()]
+else:
+    bias_binnings = [b for b, n in zip(ccdsums, names)
+                     if n.lower() == args.bias_label]
+    if len(bias_binnings):
+        BIN_X, BIN_Y = max(set(bias_binnings), key=bias_binnings.count)
+log.info('Reducing frames with binning (x, y) = (%i, %i)' % (BIN_X, BIN_Y))
+
+keep = [c == (BIN_X, BIN_Y) for c in ccdsums]
+for filename, k, c in zip(filenames, keep, ccdsums):
+    if not k:
+        log.warning('Skipping %s: binning (%i, %i) differs from (%i, %i)' %
+                    (op.basename(filename), c[0], c[1], BIN_X, BIN_Y))
+filenames = [v for v, k in zip(filenames, keep) if k]
+names = [v for v, k in zip(names, keep) if k]
+calstage = [v for v, k in zip(calstage, keep) if k]
+
+# Read noise from the bias header (it can differ slightly between modes)
+for filename, name in zip(filenames, names):
+    if name.lower() == args.bias_label:
+        READNOISE = float(fits.getheader(filename).get('RDNOISE3', READNOISE))
+        break
+
+# =============================================================================
 # 2. Configuration values
 # =============================================================================
-Ncols = 2048  # Number of columns in the detector (pixels)
-Nrows = 2048  # Number of rows in the detector (pixels)
+Ncols = 2048 // BIN_X  # Number of columns in the (binned) frame (pixels)
+Nrows = 2048 // BIN_Y  # Number of rows in the (binned) frame (pixels)
 Bias_section_size = 32  # Width of the overscan region (pixels) used for bias correction
 gain = 0.584  # Conversion factor from electrons to ADU (Analog-to-Digital Units)
-readnoise = 3.06  # Read noise of the detector in electrons (e-)
-fiber_model_thresh = 250  # Threshold for fiber model fitting (arbitrary units)
+readnoise = READNOISE  # Read noise of the detector in electrons (e-)
+fiber_model_thresh = 250 * BIN_X * BIN_Y  # Threshold for fiber model fitting (counts per binned pixel)
 trace_order = 4  # Polynomial order used for tracing the fiber paths
-trace_ncolumns = 250  # Number of columns used for fiber tracing
+trace_ncolumns = nx(250)  # Number of columns used for fiber tracing
 flat_line_list = [  # Wavelengths (in Ångströms) of emission lines in the flat-field
     3679.9, 3705.6, 3719.9, 3722.6, 3733.3, 3734.9, 3737.1,
     3745.6, 3748.3, 3820.5, 3824.4, 3856.4, 3859.9, 3878.6,
@@ -2496,6 +2672,12 @@ bias_files = [filename for filename, name in zip(filenames, names)
 
 if len(bias_files) == 0:
     log.error('No bias files found.  Please check the "--bias_label" is correct')
+if len(bias_files):
+    _hd = fits.getheader(bias_files[0])
+    if (_hd['NAXIS2'], _hd['NAXIS1']) != (Nrows, Ncols + Bias_section_size):
+        log.error('Raw frame shape (%i, %i) does not match the expected %i x %i '
+                  'for binning (%i, %i)' % (_hd['NAXIS2'], _hd['NAXIS1'], Nrows,
+                                            Ncols + Bias_section_size, BIN_X, BIN_Y))
 avg_bias, header = build_master_bias(bias_files, Nrows, Ncols, Bias_section_size)
 
 fits.PrimaryHDU(avg_bias, header=header).writeto(op.join(reducfolder,
@@ -2537,7 +2719,7 @@ if len(arc_files) == 0:
     log.error('No arc files found.  Please check the "--arc_label" is correct')
 
 avg_arc, header = build_master_arc(arc_files, Nrows, Ncols, avg_bias)
-archival_arc = fits.open(op.join(configfolder, 'arc_image.fits'))[0].data
+archival_arc = rebin_image(fits.open(op.join(configfolder, 'arc_image.fits'))[0].data)
 
 Info = get_initial_arc_shift(avg_arc, archival_arc)
 
@@ -2546,7 +2728,7 @@ Info = get_initial_arc_shift(avg_arc, archival_arc)
 # 7. Get Trace
 # =============================================================================
 log.info('Measuring the Trace from the Flat Frame')
-archival_trace = fits.open(op.join(configfolder, 'trace_image.fits'))[0].data
+archival_trace = rebin_trace(fits.open(op.join(configfolder, 'trace_image.fits'))[0].data)
 # Add initial offset for the trace
 archival_trace = archival_trace + Info[0][0]
 back, orig = get_scattered_light(avg_ff, mask)
@@ -2609,8 +2791,8 @@ if fit_wave:
 # =============================================================================
 log.info('Adjusting the Wavelength Solution from the Archive')
 L = fits.open(op.join(configfolder, 'arc_spectra.fits'))
-archive_arc = L[1].data
-archive_wave = L[3].data
+archive_arc = rebin_orders(L[1].data, 'sum')
+archive_wave = rebin_orders(L[3].data, 'mean')
 
 
 # Adding the offset to the archive wavelength
@@ -2639,7 +2821,7 @@ fits.PrimaryHDU(wave_im).writeto(op.join(reducfolder,'wave_image.fits'),
                                                     overwrite=True)
 
 # Modeling the fibers
-model = make_fiber_model_image(avg_ff - back, full_trace, wave, npix=25,
+model = make_fiber_model_image(avg_ff - back, full_trace, wave, npix=ny(25),
                                line_list=flat_line_list,
                                line_width=flat_line_window,
                                ghost_columns=ghost_col)
@@ -2676,7 +2858,7 @@ for gc in ghost_col:
     
 # Make new model
 
-model = make_fiber_model_image(avg_ff - back, full_trace, wave, npix=25,
+model = make_fiber_model_image(avg_ff - back, full_trace, wave, npix=ny(25),
                                line_list=flat_line_list,
                                line_width=flat_line_window,
                                ghost_columns=ghost_col)
@@ -2703,7 +2885,7 @@ fits.PrimaryHDU(avg_ff - back - ghost_image).writeto(op.join(reducfolder,'ff_sub
 
 # Make new model
 model = make_fiber_model_image(avg_ff - back - ghost_image, full_trace, wave, 
-                               npix=21, line_list=flat_line_list,
+                               npix=ny(21), line_list=flat_line_list,
                                line_width=flat_line_window,
                                ghost_columns=ghost_col)
 
@@ -2742,8 +2924,8 @@ combined_wave = np.exp(np.linspace(wmin, wmax, nsteps))
 log.info('Building the deblazing function')
 fits.PrimaryHDU((avg_ff - back) / flat).writeto(op.join(reducfolder,'ff_unflat.fits'), 
                                                     overwrite=True)
-ff_spectra, ff_err = get_spectra((avg_ff - back-ghost_image) / flat, full_trace, npix=15)
-flat_spec, flat_err = get_spectra(flat, full_trace, npix=15)
+ff_spectra, ff_err = get_spectra((avg_ff - back-ghost_image) / flat, full_trace, npix=ny(15))
+flat_spec, flat_err = get_spectra(flat, full_trace, npix=ny(15))
 
 fits.PrimaryHDU(ff_spectra).writeto(op.join(reducfolder, 'ff_spectra.fits'), 
                                                     overwrite=True)
@@ -2760,8 +2942,9 @@ ratios = get_weights_for_combine(ff_spectra, wave, combined_wave)
 log.info('Reducing the Science Frames')  
 
 # Select filenames where calibration stage is 'OUT'
-sci_files = [filename for filename, calst in zip(filenames, calstage) 
-             if calst == 'OUT']
+cal_labels = [args.bias_label, args.arc_label, args.flat_label]
+sci_files = [filename for filename, calst, name in zip(filenames, calstage, names)
+             if calst == 'OUT' and name.lower() not in cal_labels]
 
 # Process the science frames
 for filename in sci_files:
@@ -2771,7 +2954,8 @@ for filename in sci_files:
     log.info('Reducing %s' % basename)
 
     # Perform basic image reduction using the master bias frame
-    image, error = base_reduction(f[0].data, masterbias=avg_bias)
+    image, error = base_reduction(f[0].data, masterbias=avg_bias,
+                                  Ncols=Ncols, readnoise=readnoise)
     original = image * 1.
     
     # Get scattered light correction
@@ -2782,7 +2966,7 @@ for filename in sci_files:
     image, error = (image / flat, error / flat)
     
     # Extract spectra from the image, using a pixel trace with npix=11
-    spec, err = get_spectra(image, full_trace, npix=11, full_data=False)
+    spec, err = get_spectra(image, full_trace, npix=ny(11), full_data=False)
     
     # Correct the trace based on the extracted spectrum
     if not args.dont_adjust_trace:
@@ -2804,8 +2988,8 @@ for filename in sci_files:
     if not reframe_from_cosmic_rejection:  # If cosmic ray detection is enabled
         smooth_error = get_continuum(error, nbins=200, use_filter=True, per=50)
         model = (error-smooth_error) / error
-        model[:, :10] = 0.0
-        model[:, -10:] = 0.0
+        model[:, :nx(10)] = 0.0
+        model[:, -nx(10):] = 0.0
         cosmic_model = model * 1.
         model = np.array((model > 0.5))
         model = convolve(model, Box2DKernel(2))
@@ -2825,7 +3009,7 @@ for filename in sci_files:
     
     
     # Re-extract spectra using the corrected trace
-    result = get_spectra(image, trace, npix=args.extraction_aperture, 
+    result = get_spectra(image, trace, npix=ny(args.extraction_aperture), 
                             full_data=args.full_aperture_extraction)
  
     if args.full_aperture_extraction:
